@@ -21,9 +21,7 @@ export const registerUser = async (req, res, next)=>{
         const token = generateToken(user.id);
 
         res.json({
-            _id: user._id,
-            username: user.username,
-            token,
+            message : "Registered successfully",
         });
     } 
     catch (error) {
