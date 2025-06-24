@@ -1,3 +1,6 @@
+USE "npm run go" TO RUN THE SERVER
+
+
 POST : http://localhost:8000/api/v1/auth/register
 BODY : {
   "username": "Sabra Jain",
@@ -78,32 +81,3 @@ BODY : {
   "recursive": "true"
 }
 //it create a folder named as newbeeMove inside newbee folder having content same as newbeeCopy
-
-
-
-
-POST : http://localhost:8000/api/v1/files
-BODY : {
-    "filename": "new.txt",
-    "content": "Hey buddy."
-}
-//create a file in the database
-
-
-
-
-GET : http://localhost:8000/api/v1/files
-//it gives the file from database
-
-
-
-PUT : http://localhost:8000/api/v1/files/:id
-BODY : {
-    "filename": "new1.txt",
-    "content": "Hey buddy part2."
-}
-
-
-
-DELETE : http://localhost:8000/api/v1/files/:id
-//it delete the file in database

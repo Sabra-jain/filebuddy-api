@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node --require ./src/utils/instrumentation.js src/server.js"
+    "go": "node --require ./src/utils/instrumentation.js src/server.js",
+    "start": "node src/server.js"
   },
   "author": "",
   "license": "ISC",

@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
+import File from '../models/file.model.js';
 
 
 const BASE_DIR = process.cwd();
@@ -44,34 +45,56 @@ export const createItem = async (req, res) => {
     return res.status(400).json({ error: 'Invalid path or type (file/dir)' });
   }
 
-  const targetPath = path.resolve(BASE_DIR, userPath);
+  try {
+    const targetPath = path.resolve(BASE_DIR, userPath);
+    const parts = path.relative(BASE_DIR, targetPath).split(path.sep);
+    let relativePath = "";
 
-  if (type === 'dir') {
-    try {
-      await fs.mkdir(targetPath);
-      return res.status(201).json({ message: 'Folder successfully created' });
-    } catch (error) {
-      if (error.code === 'EEXIST') {
-        return res.status(409).json({ error: 'Folder already exists' });
-      }
-      return res.status(500).json({ error: 'Failed to create folder', details: error.message });
-    }
-  }
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      if (name === '..' || !name) continue;
 
-  if (type === 'file') {
-    try {
-      const parentDir = path.dirname(targetPath);
-      await fs.mkdir(parentDir, { recursive: true });
-      await fs.writeFile(targetPath, '', { flag: 'wx' }); // fail if file already exists
-      return res.status(201).json({ message: 'File successfully created' });
-    } catch (error) {
-      if (error.code === 'EEXIST') {
-        return res.status(409).json({ error: 'File already exists' });
+      relativePath = path.join(relativePath, name);
+      const currentPath = path.resolve(BASE_DIR, ...parts.slice(0, i + 1));
+      const isLast = i === parts.length - 1;
+      const isDir = type === "dir" || !isLast;
+
+      const existing = await File.findOne({
+        owner: req.user.id,
+        path: relativePath,
+        type: isDir ? "folder" : "file",
+      });
+
+      if (!existing) {
+        await File.create({
+          owner: req.user.id,
+          filename: name,
+          path: relativePath,
+          type: isDir ? "folder" : "file",
+        });
+      } else if (isLast) {
+        return res.status(409).json({ message: `${type} already exists` });
       }
-      return res.status(500).json({ error: 'Failed to create file', details: error.message });
+
+      try {
+        if (isDir) {
+          await fs.mkdir(currentPath);
+        } else {
+          await fs.writeFile(currentPath, "", { flag: "wx" });
+        }
+      } catch (err) {
+        if (err.code !== "EEXIST") throw err;
+      }
     }
+
+    return res.status(201).json({ message: `${type} successfully created` });
+  } catch (error) {
+    return res.status(500).json({ error: `Failed to create ${type}`, details: error.message });
   }
 };
+
+
+
 
 
 export const viewFileContent = async (req, res) => {
@@ -103,6 +126,8 @@ export const viewFileContent = async (req, res) => {
 };
 
 
+
+
 export const deletePath = async (req, res) => {
   const userPath = req.query.path;
   const recursive = req.query.recursive === 'true';
@@ -116,15 +141,37 @@ export const deletePath = async (req, res) => {
   try {
     const stats = await fs.stat(targetPath);
 
+    const cleanPath = path.normalize(userPath).replace(/^(\.\.[\/\\])+/, '');
+    const topFolder = cleanPath.split(/[\/\\]/)[0];
+
     if (stats.isFile()) {
       await fs.unlink(targetPath);
+
+      await File.deleteOne({
+        owner: req.user.id,
+        path: cleanPath
+      });
+
       return res.status(200).json({ message: "File deleted successfully" });
     }
 
     if (stats.isDirectory()) {
       if (recursive) {
         await fs.rm(targetPath, { recursive: true, force: true });
-        return res.status(200).json({ message: "Directory deleted recursively" });
+
+        // Delete all mongo entries where path === "a" OR starts with "a/"
+        const allFiles = await File.find({ owner: req.user.id });
+
+        const toDelete = allFiles.filter(file =>
+          file.path === topFolder || file.path.startsWith(`${topFolder}/`) || file.path.startsWith(`${topFolder}\\`)
+        );
+
+        if (toDelete.length > 0) {
+          const ids = toDelete.map(file => file._id);
+          await File.deleteMany({ _id: { $in: ids } });
+        }
+
+        return res.status(200).json({ message: "Directory and all related entries deleted" });
       }
 
       const items = await fs.readdir(targetPath);
@@ -133,6 +180,12 @@ export const deletePath = async (req, res) => {
       }
 
       await fs.rmdir(targetPath);
+
+      await File.deleteOne({
+        owner: req.user.id,
+        path: topFolder
+      });
+
       return res.status(200).json({ message: "Empty directory deleted" });
     }
 
@@ -145,6 +198,48 @@ export const deletePath = async (req, res) => {
 };
 
 
+
+
+const toUnixPath = (p) => p.replace(/\\/g, "/");
+
+const walkAndLog = async (base, ownerId, includeRoot = false) => {
+  const entries = [];
+
+  if (includeRoot) {
+    const baseName = path.basename(base);
+    const relBase = toUnixPath(path.relative(BASE_DIR, base));
+    entries.push({
+      owner: ownerId,
+      filename: baseName,
+      path: relBase,
+      type: "folder"
+    });
+  }
+
+  const walk = async (dir) => {
+    const items = await fs.readdir(dir, { withFileTypes: true });
+
+    for (const item of items) {
+      const fullPath = path.join(dir, item.name);
+      const relPath = toUnixPath(path.relative(BASE_DIR, fullPath));
+
+      entries.push({
+        owner: ownerId,
+        filename: item.name,
+        path: relPath,
+        type: item.isDirectory() ? "folder" : "file",
+      });
+
+      if (item.isDirectory()) {
+        await walk(fullPath);
+      }
+    }
+  };
+
+  await walk(base);
+  return entries;
+};
+
 export const copyPath = async (req, res) => {
   const { sourcePath, destinationPath, recursive = false } = req.body;
 
@@ -155,6 +250,9 @@ export const copyPath = async (req, res) => {
   const src = path.resolve(BASE_DIR, sourcePath);
   const dest = path.resolve(BASE_DIR, destinationPath);
 
+  const relativeDest = toUnixPath(path.relative(BASE_DIR, dest));
+  const filename = path.basename(destinationPath);
+
   try {
     const stat = await fs.stat(src);
 
@@ -164,18 +262,44 @@ export const copyPath = async (req, res) => {
       }
 
       await fs.cp(src, dest, { recursive: true });
+
+      // Log root folder
+      const logs = await walkAndLog(dest, req.user.id);
+
+      // Add root folder entry manually beacuse walkAndLog only gives inside files/folders
+      logs.unshift({
+        owner: req.user.id,
+        filename,
+        path: relativeDest,
+        type: "folder"
+      });
+
+      await File.insertMany(logs);
+
+      return res.status(200).json({ message: 'Directory copied successfully and logged' });
+
     } else {
       await fs.copyFile(src, dest);
-    }
 
-    res.status(200).json({ message: 'Copy successful' });
+      await File.create({
+        owner: req.user.id,
+        filename,
+        path: relativeDest,
+        type: "file",
+      });
+
+      return res.status(200).json({ message: 'File copied successfully and logged' });
+    }
   } catch (err) {
     if (err.code === 'ENOENT') {
       return res.status(404).json({ error: 'Source path not found' });
     }
-    res.status(500).json({ error: 'Failed to copy path', details: err.message });
+    return res.status(500).json({ error: 'Failed to copy path', details: err.message });
   }
 };
+
+
+
 
 
 export const movePath = async (req, res) => {
@@ -187,6 +311,8 @@ export const movePath = async (req, res) => {
 
   const src = path.resolve(BASE_DIR, sourcePath);
   const dest = path.resolve(BASE_DIR, destinationPath);
+  const relDest = toUnixPath(path.relative(BASE_DIR, dest));
+  const filename = path.basename(destinationPath);
 
   try {
     const stat = await fs.stat(src);
@@ -195,18 +321,58 @@ export const movePath = async (req, res) => {
       if (!recursive) {
         return res.status(400).json({ error: 'Use recursive: true to move directories' });
       }
+
+      // Move locally
       await fs.cp(src, dest, { recursive: true });
       await fs.rm(src, { recursive: true });
+
+      // Delete old entries
+      const relSrc = toUnixPath(path.relative(BASE_DIR, src));
+      await File.deleteMany({
+        owner: req.user.id,
+        path: { $regex: `^${relSrc}` }
+      });
+
+      // Log new entries using walkAndLog
+      const newEntries = await walkAndLog(dest, req.user.id, true);
+
+      for (const item of newEntries) {
+        await File.findOneAndUpdate(
+          { owner: req.user.id, path: item.path },
+          item,
+          { upsert: true, new: true }
+        );
+      }
+
+      return res.status(200).json({ message: "Folder moved and MongoDB updated" });
     } else {
       await fs.copyFile(src, dest);
       await fs.unlink(src);
+
+      const existing = await File.findOne({
+        owner: req.user.id,
+        filename,
+        type: "file"
+      });
+
+      if (existing) {
+        await File.updateOne({ _id: existing._id }, { $set: { path: relDest } });
+      } else {
+        await File.create({
+          owner: req.user.id,
+          filename,
+          path: relDest,
+          type: "file",
+        });
+      }
+
+      return res.status(200).json({ message: "File moved and MongoDB updated" });
     }
 
-    res.status(200).json({ message: 'Move successful' });
   } catch (err) {
     if (err.code === 'ENOENT') {
       return res.status(404).json({ error: 'Source path not found' });
     }
-    res.status(500).json({ error: 'Failed to move path', details: err.message });
+    return res.status(500).json({ error: 'Failed to move path', details: err.message });
   }
 };
